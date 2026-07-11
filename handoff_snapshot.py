@@ -37,7 +37,8 @@ MAX_FILES = 10
 MAX_COMMITS = 100
 MAX_DIFF_CHARS = 30000
 MAX_TRANSCRIPT_TAIL_BYTES = 3_000_000
-MAX_TRANSCRIPT_FILES = 24
+MAX_TRANSCRIPT_FILES = 200
+MAX_MATCHED_TRANSCRIPTS = 8
 DEFAULT_INTERVAL = 8.0
 DEFAULT_STALE_SECONDS = 120
 
@@ -292,7 +293,8 @@ def read_tail(path: Path, max_bytes: int = MAX_TRANSCRIPT_TAIL_BYTES) -> str:
         return ""
 
 
-def candidate_transcripts() -> list[tuple[str, Path]]:
+def candidate_transcripts() -> list[tuple[str, Path, float]]:
+    """Return the newest local transcript files across Claude and Codex."""
     home = Path.home()
     roots: list[tuple[str, Path]] = [
         ("Claude", home / ".claude" / "projects"),
@@ -311,20 +313,42 @@ def candidate_transcripts() -> list[tuple[str, Path]]:
         except OSError:
             pass
     candidates.sort(key=lambda item: item[2], reverse=True)
-    return [(source, path) for source, path, _ in candidates[:MAX_TRANSCRIPT_FILES]]
+    return candidates[:MAX_TRANSCRIPT_FILES]
 
 
-def repo_markers(root: Path) -> list[str]:
-    values = {
-        str(root),
-        str(root).replace("\\", "/"),
-        root.name,
+def repo_markers(root: Path) -> dict[str, list[str]]:
+    """Build strong, exact-ish markers for this repository path.
+
+    A repository basename alone is intentionally not accepted: two unrelated
+    repositories can easily share the same folder name.
+    """
+    raw = str(root.resolve())
+    slash = raw.replace("\\", "/")
+    escaped = json.dumps(raw, ensure_ascii=False)[1:-1]
+    encoded = re.sub(r"[^A-Za-z0-9]", "-", raw).strip("-")
+    return {
+        "content": [value.lower() for value in {raw, slash, escaped} if len(value) > 4],
+        "path": [encoded.lower()] if len(encoded) > 4 else [],
     }
-    # Claude often encodes the repository path in the project directory name.
-    encoded = re.sub(r"[^A-Za-z0-9]", "-", str(root)).strip("-")
-    if encoded:
-        values.add(encoded)
-    return [value.lower() for value in values if value]
+
+
+def transcript_match_score(root: Path, source: str, path: Path, tail: str) -> int:
+    """Score whether a transcript belongs to the exact repository.
+
+    Full repository-path markers are required. The folder name alone never
+    qualifies a session.
+    """
+    markers = repo_markers(root)
+    path_text = str(path).lower()
+    tail_text = tail.lower()
+    score = 0
+
+    if any(marker in tail_text for marker in markers["content"]):
+        score += 100
+    if source == "Claude" and any(marker in path_text for marker in markers["path"]):
+        score += 80
+
+    return score
 
 
 def text_from_content(value: Any) -> str:
@@ -424,25 +448,35 @@ def extract_event(source: str, obj: dict[str, Any], file_mtime: float, line_inde
 
 
 def parse_transcripts(root: Path) -> dict[str, Any]:
-    markers = repo_markers(root)
     events: list[dict[str, Any]] = []
-    matched_files: list[dict[str, Any]] = []
+    matched: list[dict[str, Any]] = []
 
-    for source, path in candidate_transcripts():
+    for source, path, mtime in candidate_transcripts():
         tail = read_tail(path)
         if not tail:
             continue
-        haystack = (str(path) + "\n" + tail[:300_000]).lower()
-        # A repository name alone is too weak; require a path-like marker or workspace marker.
-        strong_markers = [marker for marker in markers if len(marker) > 4]
-        if not any(marker in haystack for marker in strong_markers):
+        score = transcript_match_score(root, source, path, tail[:300_000])
+        if score <= 0:
             continue
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            continue
-        matched_files.append({"source": source, "path": str(path), "mtime": mtime})
-        for index, line in enumerate(tail.splitlines()):
+        matched.append({
+            "source": source,
+            "path": str(path),
+            "mtime": mtime,
+            "score": score,
+            "tail": tail,
+        })
+
+    # The primary session is always the most recently modified transcript that
+    # strongly matches this exact repository path.
+    matched.sort(key=lambda item: (item["mtime"], item["score"]), reverse=True)
+    matched = matched[:MAX_MATCHED_TRANSCRIPTS]
+    primary_path = matched[0]["path"] if matched else None
+
+    for item in matched:
+        source = item["source"]
+        path_text = item["path"]
+        mtime = item["mtime"]
+        for index, line in enumerate(item["tail"].splitlines()):
             line = line.strip()
             if not line.startswith("{"):
                 continue
@@ -451,25 +485,39 @@ def parse_transcripts(root: Path) -> dict[str, Any]:
             except json.JSONDecodeError:
                 continue
             if isinstance(obj, dict):
-                events.extend(extract_event(source, obj, mtime, index))
+                extracted = extract_event(source, obj, mtime, index)
+                for event in extracted:
+                    event["session_path"] = path_text
+                    event["session_mtime"] = mtime
+                events.extend(extracted)
 
     # Stable deduplication.
     unique: dict[str, dict[str, Any]] = {}
     for event in events:
-        key = json.dumps({k: event.get(k) for k in ("kind", "source", "at", "tool", "text")}, ensure_ascii=False, sort_keys=True)
+        key = json.dumps({k: event.get(k) for k in ("kind", "source", "at", "tool", "text", "session_path")}, ensure_ascii=False, sort_keys=True)
         unique[key] = event
     events = list(unique.values())
-    events.sort(key=lambda item: (item.get("at") or "", item.get("order") or 0))
+    events.sort(key=lambda item: (item.get("session_mtime") or 0, item.get("at") or "", item.get("order") or 0))
 
     prompts = [event for event in events if event["kind"] == "prompt"][-MAX_PROMPTS:]
     actions = [event for event in events if event["kind"] == "action"][-MAX_ACTIONS:]
     messages = [event for event in events if event["kind"] == "message"][-3:]
 
-    matched_files.sort(key=lambda item: item["mtime"], reverse=True)
+    primary_events = [event for event in events if event.get("session_path") == primary_path]
+    primary_prompts = [event for event in primary_events if event["kind"] == "prompt"]
+    primary_messages = [event for event in primary_events if event["kind"] == "message"]
+
+    matched_files = [
+        {"source": item["source"], "path": item["path"], "mtime": item["mtime"], "score": item["score"]}
+        for item in matched
+    ]
     return {
         "prompts": prompts,
         "actions": actions,
         "messages": messages,
+        "latest_prompt": primary_prompts[-1] if primary_prompts else (prompts[-1] if prompts else None),
+        "latest_message": primary_messages[-1] if primary_messages else (messages[-1] if messages else None),
+        "primary_session": matched_files[0] if matched_files else None,
         "matched_files": matched_files[:4],
     }
 
@@ -533,7 +581,9 @@ def diagnostic(git: dict[str, Any], agents: list[dict[str, Any]], transcript: di
 
 def render(root: Path, state: dict[str, Any], git: dict[str, Any], agents: list[dict[str, Any]], transcript: dict[str, Any], stale_seconds: int) -> str:
     state["updated_at"] = iso()
-    next_step, inferred = extract_planned_next(transcript.get("messages", []))
+    primary_message = transcript.get("latest_message")
+    next_messages = [primary_message] if primary_message else transcript.get("messages", [])
+    next_step, inferred = extract_planned_next(next_messages)
 
     combined_actions = list(transcript.get("actions", [])) + list(state.get("git_events", []))
     combined_actions.sort(key=lambda item: item.get("at") or "")
@@ -555,8 +605,8 @@ def render(root: Path, state: dict[str, Any], git: dict[str, Any], agents: list[
     ]
 
     prompts = transcript.get("prompts", [])
-    if prompts:
-        latest = prompts[-1]
+    latest = transcript.get("latest_prompt")
+    if latest:
         lines.extend([
             f"**Latest captured task ({latest.get('source', 'agent')}):**",
             "",
@@ -630,13 +680,16 @@ def render(root: Path, state: dict[str, Any], git: dict[str, Any], agents: list[
 
     messages = transcript.get("messages", [])
     lines.extend(["", "## Latest recovered agent message", ""])
-    if messages:
-        last = messages[-1]
+    last = transcript.get("latest_message")
+    if last:
         lines.extend([f"**{last.get('source', 'agent')} — {last.get('at', '?')}**", "", clip(last.get("text"), 5000)])
     else:
         lines.append("No agent message found in recent local session files.")
 
     lines.extend(["", "## Passive sources inspected", ""])
+    primary = transcript.get("primary_session")
+    if primary:
+        lines.append(f"- **Primary (newest matching session):** {primary['source']} — `{primary['path']}`")
     matched = transcript.get("matched_files", [])
     if matched:
         for item in matched:

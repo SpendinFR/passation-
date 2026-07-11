@@ -71,6 +71,39 @@ def test_codex_to_claude(base: Path, home: Path):
     assert 'Codex / apply_patch' in out
     assert_common(out, repo)
 
+def test_newest_exact_repo_session(base: Path, home: Path):
+    repo = setup_repo(base, 'shared-name')
+    other = base / 'other' / 'shared-name'
+    other.mkdir(parents=True)
+
+    older = home / '.claude/projects' / 'older-correct' / 'session.jsonl'
+    write_jsonl(older, [
+        {'type':'user','timestamp':'2026-07-11T09:00:00+02:00','cwd':str(repo),'message':{'role':'user','content':'OLDER CORRECT TASK'}},
+    ])
+    os.utime(older, (1000, 1000))
+
+    wrong = home / '.codex/sessions/2026/07/11' / 'wrong.jsonl'
+    write_jsonl(wrong, [
+        {'type':'event_msg','timestamp':'2026-07-11T12:00:00+02:00','cwd':str(other),'payload':{'type':'user_message','message':'WRONG TASK'}},
+    ])
+    os.utime(wrong, (3000, 3000))
+
+    newest = home / '.codex/sessions/2026/07/11' / 'newest.jsonl'
+    write_jsonl(newest, [
+        {'type':'event_msg','timestamp':'2026-07-11T11:00:00+02:00','cwd':str(repo),'payload':{'type':'user_message','message':'NEWEST CORRECT TASK'}},
+        {'type':'event_msg','timestamp':'2026-07-11T11:00:05+02:00','cwd':str(repo),'payload':{'type':'agent_message','message':'Next step: finish app.py and run tests.'}},
+    ])
+    os.utime(newest, (2000, 2000))
+
+    env = {**os.environ, 'HOME': str(home)}
+    run([sys.executable, str(SCRIPT), '--repo', str(repo)], repo, env)
+    out = (repo / 'passationlive.md').read_text()
+    assert 'NEWEST CORRECT TASK' in out
+    assert 'WRONG TASK' not in out
+    assert '**Primary (newest matching session):** Codex' in out
+    assert 'finish app.py and run tests' in out
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         root=Path(td)
@@ -78,7 +111,8 @@ def main():
         base=root/'repos'; base.mkdir()
         test_claude_to_codex(base, home)
         test_codex_to_claude(base, home)
-    print('PASS: Claude -> Codex and Codex -> Claude snapshot handoff tests')
+        test_newest_exact_repo_session(base, home)
+    print('PASS: both handoff directions and exact newest-session selection')
 
 if __name__ == '__main__':
     main()
