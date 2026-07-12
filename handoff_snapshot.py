@@ -29,16 +29,19 @@ from pathlib import Path
 from typing import Any
 
 OUTPUT_NAME = "passationlive.md"
+SCRIPT_VERSION = "1.1.1-context"
 STATE_PREFIX = "<!-- PASSATION_PASSIVE_STATE_V1:"
 STATE_SUFFIX = "-->"
 MAX_PROMPTS = 4
-MAX_ACTIONS = 10
-MAX_FILES = 10
+MAX_ACTIONS = 20
+MAX_FILES = 50
 MAX_COMMITS = 100
-MAX_DIFF_CHARS = 30000
 MAX_TRANSCRIPT_TAIL_BYTES = 3_000_000
+MAX_TRANSCRIPT_HEAD_BYTES = 500_000
 MAX_TRANSCRIPT_FILES = 200
 MAX_MATCHED_TRANSCRIPTS = 8
+MAX_EXCHANGES = 4
+MAX_CHECKPOINTS = 3
 DEFAULT_INTERVAL = 8.0
 DEFAULT_STALE_SECONDS = 120
 
@@ -81,6 +84,30 @@ def clip(text: Any, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + f"\n… (+{len(text) - limit} characters)"
+
+
+NOISE_PROMPT_MARKERS = (
+    "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<environment_context>",
+    "<task-notification>",
+)
+
+
+def is_real_prompt(text: Any) -> bool:
+    value = clip(text, 12000).strip()
+    if not value:
+        return False
+    lowered = value.lower()
+    if any(marker in lowered for marker in NOISE_PROMPT_MARKERS):
+        return False
+    if re.fullmatch(r"/?model(?:\s+.*)?", lowered):
+        return False
+    return True
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -177,8 +204,6 @@ def collect_git(root: Path) -> dict[str, Any]:
     entries = status_entries(root)
 
     stat = run_cmd(["git", "diff", "HEAD", "--stat"], root).stdout.strip()
-    diff = run_cmd(["git", "diff", "HEAD", "--no-ext-diff", "--unified=3"], root, timeout=30).stdout
-
     # All commits from today across visible local refs.
     commits_raw = run_cmd(
         [
@@ -223,7 +248,6 @@ def collect_git(root: Path) -> dict[str, Any]:
         "dirty": bool(entries),
         "entries": entries,
         "stat": stat,
-        "diff": clip(diff, MAX_DIFF_CHARS),
         "commits_today": commits,
         "untracked_previews": untracked_previews,
         "signature": signature,
@@ -279,6 +303,14 @@ def detect_agents(root: Path) -> list[dict[str, Any]]:
         if source:
             found.append({"source": source, "pid": pid, "age_seconds": int(parts[1]), "command": clip(command, 500)})
     return found
+
+
+def read_head(path: Path, max_bytes: int = MAX_TRANSCRIPT_HEAD_BYTES) -> str:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(max_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def read_tail(path: Path, max_bytes: int = MAX_TRANSCRIPT_TAIL_BYTES) -> str:
@@ -401,11 +433,29 @@ def extract_event(source: str, obj: dict[str, Any], file_mtime: float, line_inde
     message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
     role = str(message.get("role") or obj.get("role") or payload.get("role") or "").lower()
 
-    # Common Claude message records.
+    # Common Claude message records. Task notifications are generated results,
+    # not real user prompts; preserve them as observed actions instead.
     if obj_type in {"user", "assistant"} or role in {"user", "assistant"}:
         content = text_from_content(message.get("content") if message else obj.get("content"))
         if content:
-            events.append({"kind": "prompt" if (obj_type == "user" or role == "user") else "message", "source": source, "at": at, "text": clip(content, 8000), "order": line_index})
+            is_user_record = obj_type == "user" or role == "user"
+            if is_user_record and "<task-notification>" in content.lower():
+                events.append({
+                    "kind": "action",
+                    "source": source,
+                    "at": at,
+                    "tool": "task-notification",
+                    "text": clip(content, 1800),
+                    "order": line_index,
+                })
+            else:
+                events.append({
+                    "kind": "prompt" if is_user_record else "message",
+                    "source": source,
+                    "at": at,
+                    "text": clip(content, 8000),
+                    "order": line_index,
+                })
 
     # Common Codex rollout records and generic variants.
     if payload_type in {"user_message", "input_text"}:
@@ -452,10 +502,12 @@ def parse_transcripts(root: Path) -> dict[str, Any]:
     matched: list[dict[str, Any]] = []
 
     for source, path, mtime in candidate_transcripts():
+        head = read_head(path)
         tail = read_tail(path)
-        if not tail:
+        if not head and not tail:
             continue
-        score = transcript_match_score(root, source, path, tail[:300_000])
+        match_sample = head + "\n" + tail[:300_000]
+        score = transcript_match_score(root, source, path, match_sample)
         if score <= 0:
             continue
         matched.append({
@@ -499,13 +551,56 @@ def parse_transcripts(root: Path) -> dict[str, Any]:
     events = list(unique.values())
     events.sort(key=lambda item: (item.get("session_mtime") or 0, item.get("at") or "", item.get("order") or 0))
 
-    prompts = [event for event in events if event["kind"] == "prompt"][-MAX_PROMPTS:]
+    prompts = [
+        event for event in events
+        if event["kind"] == "prompt" and is_real_prompt(event.get("text"))
+    ][-MAX_PROMPTS:]
     actions = [event for event in events if event["kind"] == "action"][-MAX_ACTIONS:]
-    messages = [event for event in events if event["kind"] == "message"][-3:]
+    messages = [event for event in events if event["kind"] == "message"][-MAX_CHECKPOINTS:]
 
     primary_events = [event for event in events if event.get("session_path") == primary_path]
-    primary_prompts = [event for event in primary_events if event["kind"] == "prompt"]
+    primary_prompts = [
+        event for event in primary_events
+        if event["kind"] == "prompt" and is_real_prompt(event.get("text"))
+    ]
     primary_messages = [event for event in primary_events if event["kind"] == "message"]
+
+    # Pair prompts and following agent messages inside each transcript. This keeps
+    # both main sessions and active Claude subagents eligible, without changing
+    # the existing newest-session selection logic.
+    exchanges: list[dict[str, Any]] = []
+    by_session: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        by_session.setdefault(str(event.get("session_path") or ""), []).append(event)
+    for session_path, session_events in by_session.items():
+        session_events.sort(key=lambda item: item.get("order") or 0)
+        current_prompt: dict[str, Any] | None = None
+        current_messages: list[dict[str, Any]] = []
+
+        def flush_exchange() -> None:
+            nonlocal current_prompt, current_messages
+            if current_prompt and current_messages:
+                exchanges.append({
+                    "source": current_prompt.get("source"),
+                    "session_path": session_path,
+                    "prompt": current_prompt,
+                    "messages": list(current_messages),
+                    "at": current_messages[-1].get("at") or current_prompt.get("at"),
+                    "session_mtime": current_prompt.get("session_mtime") or 0,
+                })
+            current_prompt = None
+            current_messages = []
+
+        for event in session_events:
+            if event["kind"] == "prompt" and is_real_prompt(event.get("text")):
+                flush_exchange()
+                current_prompt = event
+            elif event["kind"] == "message" and current_prompt is not None:
+                current_messages.append(event)
+        flush_exchange()
+
+    exchanges.sort(key=lambda item: (item.get("session_mtime") or 0, item.get("at") or ""))
+    exchanges = exchanges[-MAX_EXCHANGES:]
 
     matched_files = [
         {"source": item["source"], "path": item["path"], "mtime": item["mtime"], "score": item["score"]}
@@ -515,6 +610,7 @@ def parse_transcripts(root: Path) -> dict[str, Any]:
         "prompts": prompts,
         "actions": actions,
         "messages": messages,
+        "exchanges": exchanges,
         "latest_prompt": primary_prompts[-1] if primary_prompts else (prompts[-1] if prompts else None),
         "latest_message": primary_messages[-1] if primary_messages else (messages[-1] if messages else None),
         "primary_session": matched_files[0] if matched_files else None,
@@ -596,6 +692,7 @@ def render(root: Path, state: dict[str, Any], git: dict[str, Any], agents: list[
         "> Git and local session files are read passively; Git remains the source of truth.",
         "",
         f"- **Updated:** {state['updated_at']}",
+        f"- **Generator:** handoff_snapshot.py `{SCRIPT_VERSION}` — `{Path(__file__).resolve()}`",
         f"- **Repository:** `{root}`",
         f"- **Status:** {diagnostic(git, agents, transcript, stale_seconds)}",
         f"- **Detected agents:** {', '.join(agent['source'] for agent in agents) if agents else 'none'}",
@@ -637,6 +734,39 @@ def render(root: Path, state: dict[str, Any], git: dict[str, Any], agents: list[
     if not prompts:
         lines.append("No task found.")
 
+    exchanges = transcript.get("exchanges", [])
+    lines.extend(["", f"## {MAX_EXCHANGES} latest real exchanges", ""])
+    for index, exchange in enumerate(reversed(exchanges), 1):
+        prompt = exchange.get("prompt") or {}
+        answer_parts = [clip(message.get("text"), 2200) for message in exchange.get("messages", [])]
+        answer = "\n\n".join(part for part in answer_parts if part)
+        lines.extend([
+            f"### Exchange {index} — {exchange.get('source', 'agent')} — {exchange.get('at', '?')}",
+            "",
+            "**User / instruction:**",
+            "",
+            clip(prompt.get("text"), 1800),
+            "",
+            "**Agent:**",
+            "",
+            clip(answer, 5000) if answer else "No agent response recovered.",
+            "",
+        ])
+    if not exchanges:
+        lines.append("No complete prompt/response exchange recovered.")
+
+    checkpoints = transcript.get("messages", [])
+    lines.extend(["", f"## {MAX_CHECKPOINTS} latest agent checkpoints", ""])
+    for index, checkpoint in enumerate(reversed(checkpoints), 1):
+        lines.extend([
+            f"### Checkpoint {index} — {checkpoint.get('source', 'agent')} — {checkpoint.get('at', '?')}",
+            "",
+            clip(checkpoint.get("text"), 5000),
+            "",
+        ])
+    if not checkpoints:
+        lines.append("No agent checkpoint recovered.")
+
     lines.extend(["", f"## {MAX_ACTIONS} latest observed actions", ""])
     for index, action in enumerate(reversed(combined_actions), 1):
         text = clip(action.get("text"), 700).replace("\n", " ")
@@ -665,9 +795,6 @@ def render(root: Path, state: dict[str, Any], git: dict[str, Any], agents: list[
 
     if git.get("stat"):
         lines.extend(["", "### Diff summary", "", "```text", git["stat"], "```"])
-    if git.get("diff"):
-        lines.extend(["", "### Current diff", "", "```diff", git["diff"], "```"])
-
     for preview in git.get("untracked_previews", []):
         lines.extend(["", f"### New untracked file: `{preview['path']}`", "", "```text", preview["content"], "```"])
 
@@ -722,6 +849,7 @@ def snapshot_once(root: Path, stale_seconds: int) -> int:
     atomic_write(root / OUTPUT_NAME, render(root, state, git, agents, transcript, stale_seconds))
 
     print(f"Handoff snapshot written: {root / OUTPUT_NAME}")
+    print(f"Generator: {SCRIPT_VERSION} — {Path(__file__).resolve()}")
     print("No background process remains active, and no Claude/Codex hook or configuration was modified.")
     return 0
 
