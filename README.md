@@ -8,16 +8,18 @@ The script does **not** install hooks, modify Claude/Codex configuration, or run
 
 ## What it captures
 
-- the 4 latest recovered prompts/tasks;
-- the 10 latest recovered tool actions;
-- the latest recovered agent message and explicit next step;
-- the 10 most recently modified files;
-- the current uncommitted Git diff;
-- previews of small untracked files;
-- all local commits made today;
-- whether Claude Code or Codex CLI still appears to be running.
+* the 4 latest recovered prompts/tasks;
+* the 4 latest complete prompt/response exchanges;
+* the 3 latest recovered agent checkpoints;
+* the 20 latest recovered tool actions;
+* the latest recovered agent message and explicit next step;
+* up to 50 currently modified or untracked files;
+* a summary of the current uncommitted Git changes;
+* previews of small untracked files;
+* all local commits made today;
+* whether Claude Code or Codex CLI still appears to be running.
 
-Git is treated as the source of truth. Local Claude and Codex session files are read on a best-effort basis to reconstruct the interrupted task.
+Git is treated as the source of truth. Local Claude and Codex session files, including Claude subagent transcripts, are read on a best-effort basis to reconstruct the interrupted task.
 
 ## Requirements
 
