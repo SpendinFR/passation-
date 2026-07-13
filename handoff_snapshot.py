@@ -29,19 +29,20 @@ from pathlib import Path
 from typing import Any
 
 OUTPUT_NAME = "passationlive.md"
-SCRIPT_VERSION = "1.1.1-context"
+SCRIPT_VERSION = "1.2.0-passive-timeline"
 STATE_PREFIX = "<!-- PASSATION_PASSIVE_STATE_V1:"
 STATE_SUFFIX = "-->"
-MAX_PROMPTS = 4
 MAX_ACTIONS = 20
 MAX_FILES = 50
-MAX_COMMITS = 100
+MAX_COMMITS = 10
+MAX_COMMIT_FILE_DETAILS = 3
+MAX_FILES_PER_COMMIT = 20
 MAX_TRANSCRIPT_TAIL_BYTES = 3_000_000
 MAX_TRANSCRIPT_HEAD_BYTES = 500_000
 MAX_TRANSCRIPT_FILES = 200
 MAX_MATCHED_TRANSCRIPTS = 8
 MAX_EXCHANGES = 4
-MAX_CHECKPOINTS = 3
+MAX_TIMELINE_MILESTONES = 8
 DEFAULT_INTERVAL = 8.0
 DEFAULT_STALE_SECONDS = 120
 
@@ -204,21 +205,32 @@ def collect_git(root: Path) -> dict[str, Any]:
     entries = status_entries(root)
 
     stat = run_cmd(["git", "diff", "HEAD", "--stat"], root).stdout.strip()
-    # All commits from today across visible local refs.
     commits_raw = run_cmd(
         [
-            "git", "log", "--all", "--since=midnight",
+            "git", "log", "--all",
             "--pretty=%h%x09%ad%x09%an%x09%s", "--date=iso-local",
             f"--max-count={MAX_COMMITS}",
         ],
         root,
         timeout=20,
     ).stdout
-    commits: list[dict[str, str]] = []
+    commits: list[dict[str, Any]] = []
     for line in commits_raw.splitlines():
         parts = line.split("\t", 3)
-        if len(parts) == 4:
-            commits.append({"sha": parts[0], "at": parts[1], "author": parts[2], "subject": parts[3]})
+        if len(parts) != 4:
+            continue
+        commit: dict[str, Any] = {
+            "sha": parts[0], "at": parts[1], "author": parts[2], "subject": parts[3]
+        }
+        if len(commits) < MAX_COMMIT_FILE_DETAILS:
+            commit["stat"] = run_cmd(
+                ["git", "show", "--format=", "--shortstat", parts[0]], root, timeout=20
+            ).stdout.strip()
+            names = run_cmd(
+                ["git", "show", "--format=", "--name-only", parts[0]], root, timeout=20
+            ).stdout.splitlines()
+            commit["files"] = [name.strip() for name in names if name.strip()][:MAX_FILES_PER_COMMIT]
+        commits.append(commit)
 
     untracked_previews: list[dict[str, str]] = []
     for entry in entries:
@@ -248,10 +260,53 @@ def collect_git(root: Path) -> dict[str, Any]:
         "dirty": bool(entries),
         "entries": entries,
         "stat": stat,
-        "commits_today": commits,
+        "commits_recent": commits,
         "untracked_previews": untracked_previews,
         "signature": signature,
     }
+
+
+def parse_timestamp(value: Any) -> dt.datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def local_timestamp(value: Any) -> str:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return str(value or "?")
+    return parsed.astimezone().isoformat(sep=" ", timespec="seconds")
+
+
+def file_timestamp(timestamp: float | None) -> str:
+    if timestamp is None:
+        return "unknown date"
+    return dt.datetime.fromtimestamp(timestamp).astimezone().isoformat(sep=" ", timespec="seconds")
+
+
+def duration_text(start: dt.datetime | None, end: dt.datetime | None) -> str:
+    if start is None or end is None or end < start:
+        return "unknown"
+    total = int((end - start).total_seconds())
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
 
 
 def human_age(timestamp: float | None) -> str:
@@ -497,6 +552,86 @@ def extract_event(source: str, obj: dict[str, Any], file_mtime: float, line_inde
     return events
 
 
+def is_substantive_message(event: dict[str, Any]) -> bool:
+    text = clip(event.get("text"), 12000).strip()
+    if len(text) < 80:
+        return False
+    lowered = text.lower()
+    if "you've hit your monthly spend limit" in lowered:
+        return False
+    return True
+
+
+def evenly_distributed(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0 or not items:
+        return []
+    if len(items) <= limit:
+        return list(items)
+    if limit == 1:
+        return [items[-1]]
+    indexes = [round(index * (len(items) - 1) / (limit - 1)) for index in range(limit)]
+    selected: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for index in indexes:
+        if index not in seen:
+            selected.append(items[index])
+            seen.add(index)
+    return selected
+
+
+def meaningful_actions(actions: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Collapse passive transcript noise without interpreting task semantics."""
+    prepared: list[dict[str, Any]] = []
+    wait_group: dict[str, Any] | None = None
+
+    def flush_wait() -> None:
+        nonlocal wait_group
+        if wait_group and wait_group["count"] >= 2:
+            prepared.append({
+                "kind": "action",
+                "source": wait_group["source"],
+                "at": wait_group["end"],
+                "tool": "wait-group",
+                "text": (
+                    f"Waited/polled {wait_group['count']} times between "
+                    f"{local_timestamp(wait_group['start'])} and {local_timestamp(wait_group['end'])}."
+                ),
+            })
+        wait_group = None
+
+    for action in actions:
+        tool = str(action.get("tool") or "").lower()
+        if tool in {"wait", "sleep"}:
+            if wait_group and wait_group["source"] == action.get("source"):
+                wait_group["count"] += 1
+                wait_group["end"] = action.get("at")
+            else:
+                flush_wait()
+                wait_group = {
+                    "source": action.get("source", "agent"),
+                    "start": action.get("at"),
+                    "end": action.get("at"),
+                    "count": 1,
+                }
+            continue
+
+        flush_wait()
+        normalized = re.sub(r"\s+", " ", clip(action.get("text"), 4000)).strip()
+        if prepared:
+            previous = prepared[-1]
+            previous_key = (
+                previous.get("source"), previous.get("tool"),
+                re.sub(r"\s+", " ", clip(previous.get("text"), 4000)).strip(),
+            )
+            current_key = (action.get("source"), action.get("tool"), normalized)
+            if current_key == previous_key:
+                continue
+        prepared.append(action)
+
+    flush_wait()
+    return prepared[-limit:]
+
+
 def parse_transcripts(root: Path) -> dict[str, Any]:
     events: list[dict[str, Any]] = []
     matched: list[dict[str, Any]] = []
@@ -518,8 +653,6 @@ def parse_transcripts(root: Path) -> dict[str, Any]:
             "tail": tail,
         })
 
-    # The primary session is always the most recently modified transcript that
-    # strongly matches this exact repository path.
     matched.sort(key=lambda item: (item["mtime"], item["score"]), reverse=True)
     matched = matched[:MAX_MATCHED_TRANSCRIPTS]
     primary_path = matched[0]["path"] if matched else None
@@ -543,31 +676,37 @@ def parse_transcripts(root: Path) -> dict[str, Any]:
                     event["session_mtime"] = mtime
                 events.extend(extracted)
 
-    # Stable deduplication.
     unique: dict[str, dict[str, Any]] = {}
     for event in events:
-        key = json.dumps({k: event.get(k) for k in ("kind", "source", "at", "tool", "text", "session_path")}, ensure_ascii=False, sort_keys=True)
+        key = json.dumps(
+            {k: event.get(k) for k in ("kind", "source", "at", "tool", "text", "session_path")},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         unique[key] = event
     events = list(unique.values())
-    events.sort(key=lambda item: (item.get("session_mtime") or 0, item.get("at") or "", item.get("order") or 0))
+    events.sort(
+        key=lambda item: (
+            parse_timestamp(item.get("at"))
+            or dt.datetime.fromtimestamp(item.get("session_mtime") or 0, tz=dt.timezone.utc),
+            str(item.get("session_path") or ""),
+            item.get("order") or 0,
+        )
+    )
 
-    prompts = [
-        event for event in events
-        if event["kind"] == "prompt" and is_real_prompt(event.get("text"))
-    ][-MAX_PROMPTS:]
-    actions = [event for event in events if event["kind"] == "action"][-MAX_ACTIONS:]
-    messages = [event for event in events if event["kind"] == "message"][-MAX_CHECKPOINTS:]
+    actions_all = [event for event in events if event["kind"] == "action"]
+    actions = meaningful_actions(actions_all, MAX_ACTIONS)
+    messages_all = [event for event in events if event["kind"] == "message"]
 
     primary_events = [event for event in events if event.get("session_path") == primary_path]
+    primary_events.sort(key=lambda item: item.get("order") or 0)
     primary_prompts = [
         event for event in primary_events
         if event["kind"] == "prompt" and is_real_prompt(event.get("text"))
     ]
     primary_messages = [event for event in primary_events if event["kind"] == "message"]
+    primary_actions = [event for event in primary_events if event["kind"] == "action"]
 
-    # Pair prompts and following agent messages inside each transcript. This keeps
-    # both main sessions and active Claude subagents eligible, without changing
-    # the existing newest-session selection logic.
     exchanges: list[dict[str, Any]] = []
     by_session: dict[str, list[dict[str, Any]]] = {}
     for event in events:
@@ -599,34 +738,71 @@ def parse_transcripts(root: Path) -> dict[str, Any]:
                 current_messages.append(event)
         flush_exchange()
 
-    exchanges.sort(key=lambda item: (item.get("session_mtime") or 0, item.get("at") or ""))
-    exchanges = exchanges[-MAX_EXCHANGES:]
+    exchanges.sort(
+        key=lambda item: (
+            parse_timestamp(item.get("at"))
+            or dt.datetime.fromtimestamp(item.get("session_mtime") or 0, tz=dt.timezone.utc)
+        )
+    )
+    primary_exchanges = [item for item in exchanges if item.get("session_path") == primary_path]
+    recent_exchanges = (primary_exchanges or exchanges)[-MAX_EXCHANGES:]
+
+    unanswered_prompt = None
+    if primary_prompts:
+        latest_prompt = primary_prompts[-1]
+        prompt_order = latest_prompt.get("order") or 0
+        if not any((message.get("order") or 0) > prompt_order for message in primary_messages):
+            unanswered_prompt = latest_prompt
+
+    cutoff_order = None
+    if primary_exchanges and recent_exchanges:
+        orders = [
+            (exchange.get("prompt") or {}).get("order")
+            for exchange in recent_exchanges
+            if (exchange.get("prompt") or {}).get("order") is not None
+        ]
+        if orders:
+            cutoff_order = min(orders)
+    earlier_messages = [
+        message for message in primary_messages
+        if is_substantive_message(message)
+        and (cutoff_order is None or (message.get("order") or 0) < cutoff_order)
+    ]
+    timeline = evenly_distributed(earlier_messages, MAX_TIMELINE_MILESTONES)
+
+    primary_times = [parse_timestamp(event.get("at")) for event in primary_events]
+    primary_times = [value for value in primary_times if value is not None]
+    coverage = {
+        "start": min(primary_times).isoformat() if primary_times else None,
+        "end": max(primary_times).isoformat() if primary_times else None,
+        "prompts": len(primary_prompts),
+        "messages": len(primary_messages),
+        "actions": len(primary_actions),
+        "exchanges": len(primary_exchanges),
+    }
 
     matched_files = [
         {"source": item["source"], "path": item["path"], "mtime": item["mtime"], "score": item["score"]}
         for item in matched
     ]
     return {
-        "prompts": prompts,
         "actions": actions,
-        "messages": messages,
-        "exchanges": exchanges,
-        "latest_prompt": primary_prompts[-1] if primary_prompts else (prompts[-1] if prompts else None),
-        "latest_message": primary_messages[-1] if primary_messages else (messages[-1] if messages else None),
+        "exchanges": recent_exchanges,
+        "timeline": timeline,
+        "unanswered_prompt": unanswered_prompt,
+        "latest_prompt": primary_prompts[-1] if primary_prompts else None,
+        "latest_message": primary_messages[-1] if primary_messages else (messages_all[-1] if messages_all else None),
+        "primary_messages": primary_messages,
+        "coverage": coverage,
         "primary_session": matched_files[0] if matched_files else None,
-        "matched_files": matched_files[:4],
+        "matched_files": matched_files,
     }
 
 
-def extract_planned_next(messages: list[dict[str, Any]]) -> tuple[str, bool]:
-    if not messages:
-        return "Review the latest task, the most recently modified file, and the diff before continuing.", True
-
-    # Search from newest to oldest. Capture to end-of-line because filenames such as test_app.py contain periods.
+def extract_planned_next(messages: list[dict[str, Any]]) -> str | None:
     patterns = [
-        r"(?i)(?:^|\b)(?:prochaine étape|next step)\s*[:\-]\s*(.+)$",
-        r"(?i)(?:^|\b)(?:je vais maintenant|je vais ensuite)\s+(.+)$",
-        r"(?i)(?:^|\b)(?:ensuite|puis)\s*[:,\-]?\s*(.+)$",
+        r"(?i)(?:^|[.!?]\s+)(?:prochaine étape|prochaine etape|next step|resume point|reprise exacte|à faire maintenant|a faire maintenant)\s*[:\-]\s*(.+)$",
+        r"(?i)^(?:je vais maintenant|je vais ensuite)\s+(.+)$",
     ]
     for message in reversed(messages):
         text = message.get("text") or ""
@@ -635,10 +811,8 @@ def extract_planned_next(messages: list[dict[str, Any]]) -> tuple[str, bool]:
             for pattern in patterns:
                 match = re.search(pattern, candidate)
                 if match:
-                    result = match.group(1).strip().rstrip()
-                    return clip(result, 700).replace("\n", " "), False
-
-    return "Review the latest task, the most recently modified file, and the diff; finish the uncommitted step before starting another one.", True
+                    return clip(match.group(1).strip(), 700).replace("\n", " ")
+    return None
 
 
 def git_events_from_change(state: dict[str, Any], git: dict[str, Any]) -> list[dict[str, Any]]:
@@ -670,78 +844,95 @@ def diagnostic(git: dict[str, Any], agents: list[dict[str, Any]], transcript: di
         if age <= stale_seconds:
             return "POSSIBLE INTERRUPTION — recent uncommitted changes and no active agent detected"
         return "LIKELY INCOMPLETE STEP — uncommitted changes remain on disk"
-    if transcript.get("prompts"):
+    if transcript.get("latest_prompt"):
         return "NO ACTIVE AGENT — latest known task is available in local transcripts"
     return "NO ACTIVE STEP DETECTED"
 
 
 def render(root: Path, state: dict[str, Any], git: dict[str, Any], agents: list[dict[str, Any]], transcript: dict[str, Any], stale_seconds: int) -> str:
     state["updated_at"] = iso()
-    primary_message = transcript.get("latest_message")
-    next_messages = [primary_message] if primary_message else transcript.get("messages", [])
-    next_step, inferred = extract_planned_next(next_messages)
+    next_step = extract_planned_next(transcript.get("primary_messages", [])[-12:])
 
     combined_actions = list(transcript.get("actions", [])) + list(state.get("git_events", []))
-    combined_actions.sort(key=lambda item: item.get("at") or "")
-    combined_actions = combined_actions[-MAX_ACTIONS:]
+    combined_actions.sort(key=lambda item: parse_timestamp(item.get("at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc))
+    combined_actions = meaningful_actions(combined_actions, MAX_ACTIONS)
+
+    process_counts: dict[str, int] = {}
+    for agent in agents:
+        source = agent.get("source", "Other")
+        process_counts[source] = process_counts.get(source, 0) + 1
+    process_summary = ", ".join(f"{name} {count}" for name, count in sorted(process_counts.items())) or "none"
 
     lines = [
         "# Live handoff — passive snapshot",
         "",
-        "> Generated without hooks and without modifying Claude Code or Codex CLI configuration.",
-        "> Git and local session files are read passively; Git remains the source of truth.",
+        "> Generated without hooks, model calls, or changes to Claude Code/Codex CLI configuration.",
+        "> Git and existing local session files are read passively; Git remains the source of truth.",
         "",
         f"- **Updated:** {state['updated_at']}",
         f"- **Generator:** handoff_snapshot.py `{SCRIPT_VERSION}` — `{Path(__file__).resolve()}`",
         f"- **Repository:** `{root}`",
         f"- **Status:** {diagnostic(git, agents, transcript, stale_seconds)}",
-        f"- **Detected agents:** {', '.join(agent['source'] for agent in agents) if agents else 'none'}",
+        f"- **OS agent processes present:** {process_summary}",
         "",
         "## Immediate resume context",
         "",
     ]
 
-    prompts = transcript.get("prompts", [])
+    unanswered = transcript.get("unanswered_prompt")
     latest = transcript.get("latest_prompt")
-    if latest:
+    if unanswered:
         lines.extend([
-            f"**Latest captured task ({latest.get('source', 'agent')}):**",
+            f"**Latest unanswered instruction ({unanswered.get('source', 'agent')} — {local_timestamp(unanswered.get('at'))}):**",
             "",
-            clip(latest.get("text"), 2500),
+            clip(unanswered.get("text"), 2500),
+            "",
+        ])
+    elif latest:
+        lines.extend([
+            f"**Latest instruction is answered** ({latest.get('source', 'agent')} — {local_timestamp(latest.get('at'))}).",
             "",
         ])
     else:
-        lines.extend([
-            "**Latest captured task:** not found in local session files.",
-            "",
-            "The next agent must rely on Git and your latest manual prompt.",
-            "",
-        ])
+        lines.extend(["**No user instruction recovered from the primary session.**", ""])
 
-    label = "Inferred next step" if inferred else "Next step found in the latest agent message"
+    if next_step:
+        lines.extend([f"**Explicit next step recovered:** {next_step}", ""])
+    else:
+        lines.extend(["**Explicit next step:** none recovered from recent agent messages.", ""])
+
     lines.extend([
-        f"**{label}:** {next_step}",
-        "",
         "Recommended resume flow: read this file, then run `git status --short`, `git diff --stat`, and `git diff` before editing anything.",
         "",
-        f"## {MAX_PROMPTS} latest tasks/prompts",
+        "## Recovered session coverage",
         "",
     ])
 
-    for index, prompt in enumerate(reversed(prompts), 1):
-        text = clip(prompt.get("text"), 900).replace("\n", " ")
-        lines.append(f"{index}. **{prompt.get('source', 'agent')} — {prompt.get('at', '?')}** — {text}")
-    if not prompts:
-        lines.append("No task found.")
+    coverage = transcript.get("coverage", {})
+    start = parse_timestamp(coverage.get("start"))
+    end = parse_timestamp(coverage.get("end"))
+    primary = transcript.get("primary_session")
+    matched = transcript.get("matched_files", [])
+    claude_main = sum(1 for item in matched if item.get("source") == "Claude" and "subagents" not in item.get("path", "").lower())
+    claude_sub = sum(1 for item in matched if item.get("source") == "Claude" and "subagents" in item.get("path", "").lower())
+    codex_sessions = sum(1 for item in matched if item.get("source") == "Codex")
+    lines.extend([
+        f"- **Primary matching session:** {primary.get('source') if primary else 'none'}",
+        f"- **Recovered activity:** {local_timestamp(coverage.get('start'))} → {local_timestamp(coverage.get('end'))}",
+        f"- **Duration covered:** {duration_text(start, end)}",
+        f"- **Primary-session records:** {coverage.get('prompts', 0)} prompts, {coverage.get('messages', 0)} agent messages, {coverage.get('actions', 0)} tool actions, {coverage.get('exchanges', 0)} complete exchanges",
+        f"- **Matching transcript files:** Codex {codex_sessions}, Claude main {claude_main}, Claude subagents {claude_sub}",
+        "",
+    ])
 
     exchanges = transcript.get("exchanges", [])
-    lines.extend(["", f"## {MAX_EXCHANGES} latest real exchanges", ""])
+    lines.extend([f"## {len(exchanges)} latest complete exchanges", ""])
     for index, exchange in enumerate(reversed(exchanges), 1):
         prompt = exchange.get("prompt") or {}
         answer_parts = [clip(message.get("text"), 2200) for message in exchange.get("messages", [])]
         answer = "\n\n".join(part for part in answer_parts if part)
         lines.extend([
-            f"### Exchange {index} — {exchange.get('source', 'agent')} — {exchange.get('at', '?')}",
+            f"### Exchange {index} — {exchange.get('source', 'agent')} — {local_timestamp(exchange.get('at'))}",
             "",
             "**User / instruction:**",
             "",
@@ -755,41 +946,48 @@ def render(root: Path, state: dict[str, Any], git: dict[str, Any], agents: list[
     if not exchanges:
         lines.append("No complete prompt/response exchange recovered.")
 
-    checkpoints = transcript.get("messages", [])
-    lines.extend(["", f"## {MAX_CHECKPOINTS} latest agent checkpoints", ""])
-    for index, checkpoint in enumerate(reversed(checkpoints), 1):
+    timeline = transcript.get("timeline", [])
+    lines.extend(["", f"## Earlier primary-session timeline — {len(timeline)} milestones before the latest exchanges", ""])
+    for index, milestone in enumerate(timeline, 1):
         lines.extend([
-            f"### Checkpoint {index} — {checkpoint.get('source', 'agent')} — {checkpoint.get('at', '?')}",
+            f"### Milestone {index} — {milestone.get('source', 'agent')} — {local_timestamp(milestone.get('at'))}",
             "",
-            clip(checkpoint.get("text"), 5000),
+            clip(milestone.get("text"), 2200),
             "",
         ])
-    if not checkpoints:
-        lines.append("No agent checkpoint recovered.")
+    if not timeline:
+        lines.append("No earlier substantive agent milestones recovered.")
 
-    lines.extend(["", f"## {MAX_ACTIONS} latest observed actions", ""])
+    lines.extend(["", f"## {len(combined_actions)} latest meaningful observed actions (limit {MAX_ACTIONS})", ""])
     for index, action in enumerate(reversed(combined_actions), 1):
         text = clip(action.get("text"), 700).replace("\n", " ")
         tool = action.get("tool") or action.get("kind") or "action"
-        lines.append(f"{index}. `{action.get('at', '?')}` — **{action.get('source', 'agent')} / {tool}** — {text}")
+        lines.append(f"{index}. `{local_timestamp(action.get('at'))}` — **{action.get('source', 'agent')} / {tool}** — {text}")
     if not combined_actions:
         lines.append("No action found.")
 
+    entries = git.get("entries", [])
+    shown_entries = entries[:MAX_FILES]
     lines.extend([
         "",
-        "## Live Git state",
+        "## Current Git worktree",
         "",
         f"- **Branch:** `{git.get('branch') or '?'}`",
         f"- **HEAD:** `{git.get('head') or '?'}` — {git.get('head_subject') or ''}",
         f"- **Uncommitted changes:** {'yes' if git.get('dirty') else 'no'}",
+        f"- **Worktree entries:** {len(entries)} total; showing {len(shown_entries)} (limit {MAX_FILES})",
         "",
-        f"### {MAX_FILES} most recently modified files",
+        f"### Current modified or untracked files — {len(shown_entries)} shown",
         "",
     ])
-    entries = git.get("entries", [])
-    for entry in entries[:MAX_FILES]:
+    for entry in shown_entries:
         old = f" from `{entry['old_path']}`" if entry.get("old_path") else ""
-        lines.append(f"- `{entry.get('code', '??')}` `{entry.get('path')}`{old} — {human_age(entry.get('mtime'))}")
+        lines.append(
+            f"- `{entry.get('code', '??')}` `{entry.get('path')}`{old} — "
+            f"{file_timestamp(entry.get('mtime'))} ({human_age(entry.get('mtime'))})"
+        )
+    if len(entries) > MAX_FILES:
+        lines.append(f"- … {len(entries) - MAX_FILES} additional worktree entries omitted.")
     if not entries:
         lines.append("No modified files.")
 
@@ -798,36 +996,38 @@ def render(root: Path, state: dict[str, Any], git: dict[str, Any], agents: list[
     for preview in git.get("untracked_previews", []):
         lines.extend(["", f"### New untracked file: `{preview['path']}`", "", "```text", preview["content"], "```"])
 
-    lines.extend(["", "## All commits from today", ""])
-    commits = git.get("commits_today", [])
-    for commit in commits:
-        lines.append(f"- `{commit['sha']}` — {commit['at']} — {commit['subject']} — _{commit['author']}_")
+    commits = git.get("commits_recent", [])
+    lines.extend(["", f"## Last {len(commits)} local commits (limit {MAX_COMMITS})", ""])
+    for index, commit in enumerate(commits, 1):
+        lines.append(f"### {index}. `{commit['sha']}` — {commit['at']} — {commit['subject']} — _{commit['author']}_")
+        if commit.get("stat"):
+            lines.append(f"- {commit['stat']}")
+        if commit.get("files"):
+            lines.append("- Files:")
+            for name in commit["files"]:
+                lines.append(f"  - `{name}`")
+        lines.append("")
     if not commits:
-        lines.append("No commits today.")
+        lines.append("No local commit found.")
 
-    messages = transcript.get("messages", [])
-    lines.extend(["", "## Latest recovered agent message", ""])
-    last = transcript.get("latest_message")
-    if last:
-        lines.extend([f"**{last.get('source', 'agent')} — {last.get('at', '?')}**", "", clip(last.get("text"), 5000)])
+    lines.extend(["", "## Agent/session activity", ""])
+    if primary:
+        lines.append(f"- **Primary matching transcript:** {primary['source']} — `{primary['path']}`")
+        lines.append(f"- **Primary transcript file modified:** {file_timestamp(primary.get('mtime'))}")
     else:
-        lines.append("No agent message found in recent local session files.")
+        lines.append("- **Primary matching transcript:** none")
+    lines.append(f"- **Last recovered primary-session event:** {local_timestamp(coverage.get('end'))}")
+    lines.append(f"- **Matching transcripts:** Codex {codex_sessions}, Claude main {claude_main}, Claude subagents {claude_sub}")
+    lines.append(f"- **OS processes present:** {process_summary}")
+    lines.append("- Process presence alone does not prove that a process is actively working on this repository; transcript recency is the stronger signal.")
 
     lines.extend(["", "## Passive sources inspected", ""])
-    primary = transcript.get("primary_session")
-    if primary:
-        lines.append(f"- **Primary (newest matching session):** {primary['source']} — `{primary['path']}`")
-    matched = transcript.get("matched_files", [])
     if matched:
         for item in matched:
-            lines.append(f"- {item['source']}: `{item['path']}`")
+            role = "Claude subagent" if item.get("source") == "Claude" and "subagents" in item.get("path", "").lower() else item.get("source")
+            lines.append(f"- {role}: `{item['path']}` — file modified {file_timestamp(item.get('mtime'))}")
     else:
         lines.append("No transcript matching this repository was identified.")
-
-    if agents:
-        lines.extend(["", "## Detected agent processes", ""])
-        for agent in agents:
-            lines.append(f"- **{agent['source']}** — `{agent.get('command', '')}`")
 
     lines.extend(["", encode_state(state), ""])
     return "\n".join(lines)
