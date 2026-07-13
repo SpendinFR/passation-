@@ -8,20 +8,39 @@ The script does **not** install hooks, modify Claude/Codex configuration, or run
 
 ## What it captures
 
-the 4 latest complete prompt/response exchanges;
-8 earlier progress milestones distributed across the primary session, before those latest exchanges;
-recovered session coverage, including activity range, duration, prompt, message, action, and exchange counts;
-the 20 latest meaningful recovered tool actions, with repeated waits or polling collapsed;
-the latest unanswered instruction, when one exists;
-an explicit next step only when it is clearly present in an agent message;
-up to 50 currently modified or untracked files, with exact modification times;
-a summary of the current uncommitted Git changes;
-previews of small untracked files;
-the 10 latest local commits, with statistics and file lists for the 3 most recent commits;
-matching Claude, Codex, and Claude subagent transcripts;
-recent transcript activity and compact Claude Code/Codex CLI process counts.
+* The 4 latest complete prompt/response exchanges.
+* 8 earlier progress milestones distributed across the primary session, before the latest exchanges.
+* Recovered session coverage, including:
 
-Git is treated as the source of truth. Existing local Claude and Codex session files, including matching Claude subagent transcripts, are read passively and on a best-effort basis to reconstruct the work completed before an interruption. The script does not install hooks, call a model, or modify Claude Code or Codex CLI configuration.
+  * activity start and end times;
+  * total duration;
+  * prompt count;
+  * agent-message count;
+  * tool-action count;
+  * complete-exchange count.
+* The 20 latest meaningful recovered tool actions, with repeated waits and polling collapsed.
+* The latest unanswered instruction, when one exists.
+* An explicit next step only when it is clearly present in an agent message.
+* Up to 50 currently modified or untracked files, with exact modification times.
+* A summary of the current uncommitted Git changes.
+* Previews of small untracked files.
+* The 10 latest local commits.
+* Statistics and modified-file lists for the 3 most recent commits.
+* Matching Claude Code, Codex CLI, and Claude subagent transcripts.
+* Recent transcript activity and compact Claude Code/Codex CLI process counts.
+
+Git is treated as the source of truth.
+
+Existing local Claude and Codex session files, including matching Claude subagent transcripts, are read passively and on a best-effort basis to reconstruct the work completed before an interruption.
+
+The script does not:
+
+* install hooks;
+* call an AI model;
+* modify Claude Code configuration;
+* modify Codex CLI configuration;
+* leave a background process running.
+
 
 ## Requirements
 
